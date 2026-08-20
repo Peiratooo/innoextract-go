@@ -1,0 +1,9 @@
+.idea/
+.gocache*/
+
+*.exe
+*.test
+coverage.out
+
+extract/
+temp/
