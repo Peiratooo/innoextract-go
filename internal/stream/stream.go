@@ -4,6 +4,7 @@
 package stream
 
 import (
+	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"compress/zlib"
@@ -437,7 +438,11 @@ func newLZMA1Reader(source io.Reader, limit int64) (io.Reader, io.ReadCloser, er
 	for i := 5; i < len(header); i++ {
 		header[i] = 0xff
 	}
-	reader, err := (lzma.ReaderConfig{DictCap: int(dict)}).NewReader(io.MultiReader(bytes.NewReader(header), source))
+	// The xz/lzma decoder requests input through ReadByte.  Buffer the
+	// restricted source so each byte request does not become a separate
+	// underlying file read (sliceSource ultimately uses ReaderAt).
+	buffered := bufio.NewReaderSize(source, maxReadBuffer)
+	reader, err := (lzma.ReaderConfig{DictCap: int(dict)}).NewReader(io.MultiReader(bytes.NewReader(header), buffered))
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: LZMA1 init: %v", fault.ErrCorrupt, err)
 	}
@@ -456,7 +461,8 @@ func newLZMA2Reader(source io.Reader, limit int64) (io.Reader, io.ReadCloser, er
 	if err := checkDictionary(dict, limit); err != nil {
 		return nil, nil, err
 	}
-	reader, err := (lzma.Reader2Config{DictCap: int(dict)}).NewReader2(source)
+	buffered := bufio.NewReaderSize(source, maxReadBuffer)
+	reader, err := (lzma.Reader2Config{DictCap: int(dict)}).NewReader2(buffered)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: LZMA2 init: %v", fault.ErrCorrupt, err)
 	}

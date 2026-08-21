@@ -128,6 +128,45 @@ func TestChunkCompressionMethods(t *testing.T) {
 	}
 }
 
+func TestLZMAReadersBufferInput(t *testing.T) {
+	tests := []struct {
+		name   string
+		method format.Compression
+		data   []byte
+	}{
+		{"lzma1", format.LZMA1, mustHex("5d0000100000341949ee8de912140997ae148e1c90add8996f898bffe3100000")},
+		{"lzma2", format.LZMA2, mustHex("1001001068656c6c6f20636f6d7072657373696f6e00")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := &countingReader{Reader: bytes.NewReader(test.data)}
+			reader, closer, err := newChunkDecoder(source, test.method, 1<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if closer != nil {
+				defer closer.Close()
+			}
+			if _, err := io.ReadAll(reader); err != nil {
+				t.Fatal(err)
+			}
+			if source.reads > 2 {
+				t.Fatalf("source Read calls = %d, want at most 2", source.reads)
+			}
+		})
+	}
+}
+
+type countingReader struct {
+	io.Reader
+	reads int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	r.reads++
+	return r.Reader.Read(p)
+}
+
 func TestInstructionFilterVectors(t *testing.T) {
 	encoded := []byte{0xe8, 5, 0, 0, 0}
 	want := []byte{0xe8, 0, 0, 0, 0}
