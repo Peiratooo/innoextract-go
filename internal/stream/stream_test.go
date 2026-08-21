@@ -5,9 +5,11 @@ import (
 	"compress/zlib"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"testing"
 
+	"github.com/Peiratooo/innoextract-go/internal/fault"
 	"github.com/Peiratooo/innoextract-go/internal/format"
 )
 
@@ -63,12 +65,67 @@ func TestExtractReservesAggregateBeforeOutputAllocation(t *testing.T) {
 	second.Destination = "second"
 	archive.Files = append(archive.Files, second)
 
-	results, failures, err := Extract(bytes.NewReader(raw), archive, Options{MemoryLimit: int64(len(payload) + 1)}, false)
+	reader := &countingReaderAt{reader: bytes.NewReader(raw)}
+	results, failures, err := Extract(reader, archive, Options{MemoryLimit: int64(len(payload) + 1)}, false)
 	if err != nil {
 		t.Fatalf("Extract returned archive error: %v", err)
 	}
 	if len(results) != 0 || len(failures) != 2 {
 		t.Fatalf("Extract = results %#v, failures %#v", results, failures)
+	}
+	if reader.reads != 0 {
+		t.Fatalf("Extract read %d times after aggregate output allocation had already failed", reader.reads)
+	}
+}
+
+func TestExtractInstructionFilterHonorsRemainingMemory(t *testing.T) {
+	encoded := []byte{0xe8, 5, 0, 0, 0}
+	decoded := []byte{0xe8, 0, 0, 0, 0}
+	archive, raw := testArchive(encoded, format.Stored, format.Instruction5309, decoded, decoded)
+
+	// The output buffer and materialized chunk exactly consume the budget.
+	// The instruction filter needs another len(encoded) bytes and must fail
+	// instead of allocating beyond MemoryLimit.
+	limit := int64(len(encoded) + len(decoded))
+	results, failures, err := Extract(bytes.NewReader(raw), archive, Options{MemoryLimit: limit}, false)
+	if err != nil {
+		t.Fatalf("Extract returned archive error: %v", err)
+	}
+	if len(results) != 0 || len(failures) != 1 {
+		t.Fatalf("Extract = results %#v, failures %#v", results, failures)
+	}
+	if !errors.Is(failures[0].Err, fault.ErrLimitExceeded) {
+		t.Fatalf("failure = %v, want ErrLimitExceeded", failures[0].Err)
+	}
+}
+
+func TestExtractZlibFilterHonorsRemainingMemory(t *testing.T) {
+	payload := bytes.Repeat([]byte("A"), 256)
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	if _, err := zw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	archive, raw := testArchive(compressed.Bytes(), format.Stored, format.ZlibFilter, compressed.Bytes(), payload)
+	archive.DataEntries[0].UncompressedSize = uint64(len(payload))
+	archive.Files[0].Size = uint64(len(payload))
+
+	// Output + chunk consume the entire budget. The zlib-filter output is a
+	// transient allocation and must therefore be rejected.
+	limit := int64(len(payload) + compressed.Len())
+	results, failures, err := Extract(bytes.NewReader(raw), archive, Options{MemoryLimit: limit}, false)
+	if err != nil {
+		t.Fatalf("Extract returned archive error: %v", err)
+	}
+	if len(results) != 0 || len(failures) != 1 {
+		t.Fatalf("Extract = results %#v, failures %#v", results, failures)
+	}
+	if !errors.Is(failures[0].Err, fault.ErrLimitExceeded) {
+		t.Fatalf("failure = %v, want ErrLimitExceeded", failures[0].Err)
 	}
 }
 
@@ -128,6 +185,45 @@ func TestChunkCompressionMethods(t *testing.T) {
 	}
 }
 
+func TestLZMAReadersBufferInput(t *testing.T) {
+	tests := []struct {
+		name   string
+		method format.Compression
+		data   []byte
+	}{
+		{"lzma1", format.LZMA1, mustHex("5d0000100000341949ee8de912140997ae148e1c90add8996f898bffe3100000")},
+		{"lzma2", format.LZMA2, mustHex("1001001068656c6c6f20636f6d7072657373696f6e00")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := &countingReader{Reader: bytes.NewReader(test.data)}
+			reader, closer, err := newChunkDecoder(source, test.method, 1<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if closer != nil {
+				defer closer.Close()
+			}
+			if _, err := io.ReadAll(reader); err != nil {
+				t.Fatal(err)
+			}
+			if source.reads > 2 {
+				t.Fatalf("source Read calls = %d, want at most 2", source.reads)
+			}
+		})
+	}
+}
+
+type countingReader struct {
+	io.Reader
+	reads int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	r.reads++
+	return r.Reader.Read(p)
+}
+
 func TestInstructionFilterVectors(t *testing.T) {
 	encoded := []byte{0xe8, 5, 0, 0, 0}
 	want := []byte{0xe8, 0, 0, 0, 0}
@@ -173,4 +269,14 @@ func testArchive(chunkData []byte, compression format.Compression, filter format
 func sha256Checksum(data []byte) format.Checksum {
 	sum := sha256.Sum256(data)
 	return format.Checksum{Type: format.ChecksumSHA256, Data: append([]byte(nil), sum[:]...)}
+}
+
+type countingReaderAt struct {
+	reader io.ReaderAt
+	reads  int
+}
+
+func (r *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	r.reads++
+	return r.reader.ReadAt(p, off)
 }

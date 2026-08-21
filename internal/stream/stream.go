@@ -4,6 +4,7 @@
 package stream
 
 import (
+	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"compress/zlib"
@@ -102,6 +103,9 @@ func Extract(r io.ReaderAt, a *format.Archive, opts Options, verifyOnly bool) ([
 	// for each group; a solid stream is decoded once and then shared by every
 	// file segment in that group.
 	for _, group := range groups {
+		if !groupNeeded(group, files) {
+			continue
+		}
 		chunkData, err := decodeChunk(r, a, group.chunk, key, opts, budget.available())
 		if err != nil {
 			for _, ref := range group.refs {
@@ -120,23 +124,38 @@ func Extract(r io.ReaderAt, a *format.Archive, opts Options, verifyOnly bool) ([
 			if files[ref.fileIndex].failed {
 				continue
 			}
-			segment, err := decodeFileSegment(chunkData, ref.entry.File, opts.MemoryLimit)
+			segment, err := decodeFileSegment(chunkData, ref.entry.File, budget.available())
 			if err != nil {
 				markFailure(files, ref.fileIndex, err)
 				continue
 			}
+
+			// NoFilter returns a slice of chunkData and does not allocate. All
+			// other filters materialize a temporary buffer that must remain
+			// inside the extraction memory budget until it has been copied.
+			var transient uint64
+			if ref.entry.File.Filter != format.NoFilter {
+				transient = uint64(len(segment))
+				if err := budget.reserve(transient); err != nil {
+					markFailure(files, ref.fileIndex, err)
+					continue
+				}
+			}
+
+			var segmentErr error
 			if ref.expectedSize != 0 && uint64(len(segment)) != ref.expectedSize {
-				markFailure(files, ref.fileIndex, fmt.Errorf("%w: decoded size %d, expected %d", fault.ErrCorrupt, len(segment), ref.expectedSize))
-				continue
+				segmentErr = fmt.Errorf("%w: decoded size %d, expected %d", fault.ErrCorrupt, len(segment), ref.expectedSize)
+			} else if files[ref.fileIndex].assemble {
+				if ref.destOffset > uint64(len(files[ref.fileIndex].data)) || uint64(len(segment)) > uint64(len(files[ref.fileIndex].data))-ref.destOffset {
+					segmentErr = fmt.Errorf("%w: file segment exceeds output", fault.ErrCorrupt)
+				} else {
+					copy(files[ref.fileIndex].data[int(ref.destOffset):], segment)
+				}
 			}
-			if !files[ref.fileIndex].assemble {
-				continue
+			budget.release(transient)
+			if segmentErr != nil {
+				markFailure(files, ref.fileIndex, segmentErr)
 			}
-			if ref.destOffset > uint64(len(files[ref.fileIndex].data)) || uint64(len(segment)) > uint64(len(files[ref.fileIndex].data))-ref.destOffset {
-				markFailure(files, ref.fileIndex, fmt.Errorf("%w: file segment exceeds output", fault.ErrCorrupt))
-				continue
-			}
-			copy(files[ref.fileIndex].data[int(ref.destOffset):], segment)
 		}
 		budget.release(uint64(len(chunkData)))
 	}
@@ -262,6 +281,19 @@ func buildGroups(a *format.Archive, files []fileAssembly) ([]chunkGroup, error) 
 	return groups, nil
 }
 
+func groupNeeded(group chunkGroup, files []fileAssembly) bool {
+	for _, ref := range group.refs {
+		if ref.fileIndex < 0 || ref.fileIndex >= len(files) {
+			continue
+		}
+		file := files[ref.fileIndex]
+		if !file.skip && !file.failed {
+			return true
+		}
+	}
+	return false
+}
+
 // allocateFileBuffers determines the complete output footprint before it
 // allocates any backing arrays.  verifyOnly still needs an assembled buffer
 // for files that carry a public checksum; files without one can be validated
@@ -323,15 +355,22 @@ func archiveKey(a *format.Archive, password string) ([]byte, error) {
 	if password == "" {
 		return nil, fault.ErrPasswordRequired
 	}
+	if a.Header.Password.Type == format.ChecksumPBKDF2SHA256XChaCha20 {
+		key, err := crypto.DeriveXChaChaKey([]byte(password), a.Header.PasswordSalt)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", fault.ErrUnsupportedEncryption, err)
+		}
+		if !crypto.VerifyXChaChaPassword(key, a.Header.Password.Data) {
+			return nil, fault.ErrIncorrectPassword
+		}
+		return key, nil
+	}
 	valid, err := crypto.VerifyPassword(a.Header.Password.Type, a.Header.PasswordSalt, []byte(password), a.Header.Password.Data)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", fault.ErrUnsupportedEncryption, err)
 	}
 	if !valid {
 		return nil, fault.ErrIncorrectPassword
-	}
-	if a.Header.Password.Type == format.ChecksumPBKDF2SHA256XChaCha20 {
-		return crypto.DeriveXChaChaKey([]byte(password), a.Header.PasswordSalt)
 	}
 	return []byte(password), nil
 }
@@ -437,7 +476,12 @@ func newLZMA1Reader(source io.Reader, limit int64) (io.Reader, io.ReadCloser, er
 	for i := 5; i < len(header); i++ {
 		header[i] = 0xff
 	}
-	reader, err := (lzma.ReaderConfig{DictCap: int(dict)}).NewReader(io.MultiReader(bytes.NewReader(header), source))
+	// The xz/lzma decoder consumes compressed input through ReadByte. Without
+	// an io.ByteReader here, its fallback issues one upstream Read per byte;
+	// sliceSource turns each of those into a ReaderAt.ReadAt call. Buffer the
+	// complete synthetic LZMA stream so byte reads stay in memory.
+	buffered := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(header), source), maxReadBuffer)
+	reader, err := (lzma.ReaderConfig{DictCap: int(dict)}).NewReader(buffered)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: LZMA1 init: %v", fault.ErrCorrupt, err)
 	}
@@ -456,7 +500,10 @@ func newLZMA2Reader(source io.Reader, limit int64) (io.Reader, io.ReadCloser, er
 	if err := checkDictionary(dict, limit); err != nil {
 		return nil, nil, err
 	}
-	reader, err := (lzma.Reader2Config{DictCap: int(dict)}).NewReader2(source)
+	// Reader2 has the same byte-reader behavior as Reader. Buffer the
+	// restricted chunk source to avoid one ReaderAt call per compressed byte.
+	buffered := bufio.NewReaderSize(source, maxReadBuffer)
+	reader, err := (lzma.Reader2Config{DictCap: int(dict)}).NewReader2(buffered)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: LZMA2 init: %v", fault.ErrCorrupt, err)
 	}
@@ -491,10 +538,19 @@ func decodeFileSegment(chunk []byte, file format.StoredFile, limit int64) ([]byt
 	case format.NoFilter:
 		data = raw
 	case format.Instruction4108:
+		if err := checkFilterAllocation(uint64(len(raw)), limit); err != nil {
+			return nil, err
+		}
 		data = decodeInstruction4108(raw)
 	case format.Instruction5200:
+		if err := checkFilterAllocation(uint64(len(raw)), limit); err != nil {
+			return nil, err
+		}
 		data = decodeInstruction5200(raw, false)
 	case format.Instruction5309:
+		if err := checkFilterAllocation(uint64(len(raw)), limit); err != nil {
+			return nil, err
+		}
 		data = decodeInstruction5200(raw, true)
 	case format.ZlibFilter:
 		z, err := zlib.NewReader(bytes.NewReader(raw))
@@ -504,6 +560,9 @@ func decodeFileSegment(chunk []byte, file format.StoredFile, limit int64) ([]byt
 		data, err = readAllLimit(z, limit)
 		_ = z.Close()
 		if err != nil {
+			if errors.Is(err, fault.ErrLimitExceeded) {
+				return nil, err
+			}
 			return nil, fmt.Errorf("%w: file zlib: %v", fault.ErrCorrupt, err)
 		}
 	default:
@@ -526,6 +585,13 @@ func decodeFileSegment(chunk []byte, file format.StoredFile, limit int64) ([]byt
 		}
 	}
 	return data, nil
+}
+
+func checkFilterAllocation(size uint64, limit int64) error {
+	if limit < 0 || size > uint64(limit) {
+		return fmt.Errorf("%w: file filter needs %d bytes", fault.ErrLimitExceeded, size)
+	}
+	return nil
 }
 
 func decodeInstruction4108(src []byte) []byte {
