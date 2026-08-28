@@ -8,10 +8,16 @@ import "strings"
 //
 // Inno destinations commonly contain Windows separators, constants such as
 // {app}, drive/root prefixes, and values which are not valid file-name
-// characters. Clean deliberately does not consult the local filesystem and
-// never returns an absolute path. Unknown constants are reduced to their
-// contents (the same useful fallback as innoextract's empty filename map).
+// characters. The {app} prefix is omitted because the result is relative to
+// the installation root. Clean deliberately does not consult the local
+// filesystem and never returns an absolute path. Unknown constants are
+// reduced to their contents (the same useful fallback as innoextract's empty
+// filename map).
 func Clean(raw string) string {
+	if len(raw) >= len("{app}") && strings.EqualFold(raw[:len("{app}")], "{app}") &&
+		(len(raw) == len("{app}") || raw[len("{app}")] == '\\' || raw[len("{app}")] == '/') {
+		raw = raw[len("{app}"):]
+	}
 	raw = expandConstants(raw, 0)
 
 	// A drive prefix is a root marker, not part of an output path. This also

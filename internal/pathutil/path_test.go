@@ -4,7 +4,9 @@ import "testing"
 
 func TestClean(t *testing.T) {
 	tests := map[string]string{
-		`{app}\bin\agent.exe`:                   "app/bin/agent.exe",
+		`{app}\bin\agent.exe`:                   "bin/agent.exe",
+		`{APP}/bin/agent.exe`:                   "bin/agent.exe",
+		`{application}\bin\agent.exe`:           "application/bin/agent.exe",
 		`C:\\Program Files\\Demo\\..\\demo.exe`: "Program Files/demo.exe",
 		`\\server\share\folder\\.\\file?.dll`:   "server/share/folder/file$.dll",
 		`../../outside/../inside.txt`:           "inside.txt",
